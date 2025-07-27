@@ -1,23 +1,35 @@
-import { TradingSignal, TradeExecution, Portfolio, TechnicalIndicators, SentimentData } from '../types/trading';
-import { TechnicalAnalysisService } from './technicalAnalysis';
-import { SentimentAnalyzer } from './sentimentAnalyzer';
-import { PredictionEngine } from './predictionEngine';
-import { v4 as uuidv4 } from 'uuid';
+import { PredictionEngine, PredictionResult } from './predictionEngine';
+import { TradingSignal, TradeExecution, Portfolio } from '../types/trading';
+
+export interface TradingStrategy {
+  name: string;
+  riskTolerance: 'LOW' | 'MEDIUM' | 'HIGH';
+  maxPositionSize: number;
+  stopLossPercentage: number;
+  takeProfitPercentage: number;
+  minConfidence: number;
+}
+
+export interface AutoTradingConfig {
+  enabled: boolean;
+  strategy: TradingStrategy;
+  maxDailyTrades: number;
+  maxPortfolioRisk: number;
+  symbols: string[];
+}
 
 export class TradingBot {
   private static instance: TradingBot;
-  private technicalAnalysis: TechnicalAnalysisService;
-  private sentimentAnalyzer: SentimentAnalyzer;
   private predictionEngine: PredictionEngine;
   private portfolio: Portfolio;
-  private isActive: boolean = false;
-  private signals: TradingSignal[] = [];
+  private activePositions: Map<string, TradeExecution> = new Map();
+  private tradeHistory: TradeExecution[] = [];
+  private config: AutoTradingConfig;
 
   constructor() {
-    this.technicalAnalysis = TechnicalAnalysisService.getInstance();
-    this.sentimentAnalyzer = SentimentAnalyzer.getInstance();
     this.predictionEngine = PredictionEngine.getInstance();
     this.portfolio = this.initializePortfolio();
+    this.config = this.getDefaultConfig();
   }
 
   static getInstance(): TradingBot {
@@ -27,19 +39,260 @@ export class TradingBot {
     return TradingBot.instance;
   }
 
+  async generateTradingSignals(symbols: string[]): Promise<TradingSignal[]> {
+    const signals: TradingSignal[] = [];
+
+    for (const symbol of symbols) {
+      try {
+        // Mock price data - in production, fetch from real API
+        const currentPrice = Math.random() * 50000 + 10000;
+        const priceHistory = this.generateMockPriceHistory(currentPrice);
+        
+        const marketConditions = {
+          trend: Math.random() > 0.5 ? 'BULLISH' as const : 'BEARISH' as const,
+          volatility: Math.random() * 0.8 + 0.1,
+          volume: Math.random() * 2000000 + 500000,
+          marketCap: Math.random() * 1000000000 + 100000000
+        };
+
+        const prediction = await this.predictionEngine.generatePrediction(
+          symbol,
+          currentPrice,
+          priceHistory,
+          marketConditions
+        );
+
+        if (prediction.confidence >= this.config.strategy.minConfidence) {
+          const signal: TradingSignal = {
+            symbol,
+            action: prediction.prediction === 'HOLD' ? 'HOLD' : prediction.prediction,
+            confidence: prediction.confidence,
+            price: currentPrice,
+            timestamp: new Date(),
+            reasoning: prediction.reasoning,
+            technicalIndicators: this.getMockTechnicalIndicators(),
+            sentimentScore: Math.random() * 2 - 1,
+            newsScore: Math.random() * 2 - 1,
+            socialScore: Math.random() * 2 - 1
+          };
+
+          signals.push(signal);
+        }
+      } catch (error) {
+        console.error(`Error generating signal for ${symbol}:`, error);
+      }
+    }
+
+    return signals.sort((a, b) => b.confidence - a.confidence);
+  }
+
+  async executeAutoTrading(): Promise<TradeExecution[]> {
+    if (!this.config.enabled) {
+      return [];
+    }
+
+    const signals = await this.generateTradingSignals(this.config.symbols);
+    const executions: TradeExecution[] = [];
+
+    for (const signal of signals) {
+      if (this.shouldExecuteTrade(signal)) {
+        const execution = await this.executeTrade(signal);
+        if (execution) {
+          executions.push(execution);
+        }
+      }
+    }
+
+    return executions;
+  }
+
+  private shouldExecuteTrade(signal: TradingSignal): boolean {
+    // Check daily trade limit
+    const todayTrades = this.tradeHistory.filter(trade => 
+      trade.timestamp.toDateString() === new Date().toDateString()
+    ).length;
+
+    if (todayTrades >= this.config.maxDailyTrades) {
+      return false;
+    }
+
+    // Check if we already have a position
+    if (this.activePositions.has(signal.symbol)) {
+      return false;
+    }
+
+    // Check confidence threshold
+    if (signal.confidence < this.config.strategy.minConfidence) {
+      return false;
+    }
+
+    // Check portfolio risk
+    const currentRisk = this.calculatePortfolioRisk();
+    if (currentRisk >= this.config.maxPortfolioRisk) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private async executeTrade(signal: TradingSignal): Promise<TradeExecution | null> {
+    try {
+      const positionSize = this.calculatePositionSize(signal);
+      
+      if (positionSize <= 0) {
+        return null;
+      }
+
+      const execution: TradeExecution = {
+        id: this.generateTradeId(),
+        symbol: signal.symbol,
+        action: signal.action as 'BUY' | 'SELL',
+        amount: positionSize,
+        price: signal.price,
+        timestamp: new Date(),
+        status: 'EXECUTED', // In production, this would be 'PENDING' initially
+        profit: 0
+      };
+
+      // Update portfolio
+      this.updatePortfolio(execution);
+      
+      // Add to active positions
+      this.activePositions.set(signal.symbol, execution);
+      
+      // Add to trade history
+      this.tradeHistory.push(execution);
+
+      console.log(`Executed ${execution.action} order for ${execution.symbol}:`, execution);
+      
+      return execution;
+    } catch (error) {
+      console.error('Error executing trade:', error);
+      return null;
+    }
+  }
+
+  private calculatePositionSize(signal: TradingSignal): number {
+    const maxPositionValue = this.portfolio.totalValue * this.config.strategy.maxPositionSize;
+    const positionSize = maxPositionValue / signal.price;
+    
+    // Adjust based on confidence and risk
+    const confidenceMultiplier = signal.confidence;
+    const riskMultiplier = this.getRiskMultiplier(signal);
+    
+    return positionSize * confidenceMultiplier * riskMultiplier;
+  }
+
+  private getRiskMultiplier(signal: TradingSignal): number {
+    switch (this.config.strategy.riskTolerance) {
+      case 'LOW': return 0.5;
+      case 'MEDIUM': return 0.75;
+      case 'HIGH': return 1.0;
+      default: return 0.75;
+    }
+  }
+
+  private updatePortfolio(execution: TradeExecution): void {
+    const cost = execution.amount * execution.price;
+    
+    if (execution.action === 'BUY') {
+      this.portfolio.cash -= cost;
+      
+      if (this.portfolio.positions[execution.symbol]) {
+        const existing = this.portfolio.positions[execution.symbol];
+        const totalAmount = existing.amount + execution.amount;
+        const totalCost = (existing.amount * existing.averagePrice) + cost;
+        
+        this.portfolio.positions[execution.symbol] = {
+          amount: totalAmount,
+          averagePrice: totalCost / totalAmount,
+          currentValue: totalAmount * execution.price,
+          profit: 0
+        };
+      } else {
+        this.portfolio.positions[execution.symbol] = {
+          amount: execution.amount,
+          averagePrice: execution.price,
+          currentValue: cost,
+          profit: 0
+        };
+      }
+    } else if (execution.action === 'SELL') {
+      this.portfolio.cash += cost;
+      
+      if (this.portfolio.positions[execution.symbol]) {
+        const existing = this.portfolio.positions[execution.symbol];
+        existing.amount -= execution.amount;
+        
+        if (existing.amount <= 0) {
+          delete this.portfolio.positions[execution.symbol];
+        }
+      }
+    }
+    
+    this.updatePortfolioValue();
+  }
+
+  private updatePortfolioValue(): void {
+    let totalPositionValue = 0;
+    
+    Object.values(this.portfolio.positions).forEach(position => {
+      totalPositionValue += position.currentValue;
+    });
+    
+    this.portfolio.totalValue = this.portfolio.cash + totalPositionValue;
+  }
+
+  private calculatePortfolioRisk(): number {
+    let totalRisk = 0;
+    
+    Object.values(this.portfolio.positions).forEach(position => {
+      const positionRisk = (position.currentValue / this.portfolio.totalValue) * 0.1; // 10% risk per position
+      totalRisk += positionRisk;
+    });
+    
+    return totalRisk;
+  }
+
+  private generateMockPriceHistory(currentPrice: number): number[] {
+    const history: number[] = [];
+    let price = currentPrice;
+    
+    for (let i = 0; i < 100; i++) {
+      price += (Math.random() - 0.5) * price * 0.02; // 2% max change
+      history.unshift(price);
+    }
+    
+    return history;
+  }
+
+  private getMockTechnicalIndicators() {
+    return {
+      rsi: Math.random() * 100,
+      macd: Math.random() * 200 - 100,
+      bollingerBands: {
+        upper: Math.random() * 60000 + 40000,
+        middle: Math.random() * 50000 + 35000,
+        lower: Math.random() * 40000 + 30000
+      },
+      movingAverages: {
+        sma20: Math.random() * 50000 + 30000,
+        sma50: Math.random() * 50000 + 30000,
+        ema12: Math.random() * 50000 + 30000,
+        ema26: Math.random() * 50000 + 30000
+      }
+    };
+  }
+
+  private generateTradeId(): string {
+    return `trade_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  }
+
   private initializePortfolio(): Portfolio {
     return {
-      totalValue: 10000, // Starting with $10,000 demo money
-      assets: {
-        'USDT': {
-          amount: 10000,
-          avgPrice: 1,
-          currentPrice: 1,
-          pnl: 0,
-          pnlPercentage: 0
-        }
-      },
-      trades: [],
+      totalValue: 100000, // $100k starting portfolio
+      cash: 100000,
+      positions: {},
       performance: {
         daily: 0,
         weekly: 0,
@@ -49,259 +302,41 @@ export class TradingBot {
     };
   }
 
-  async generateTradingSignal(
-    symbol: string,
-    currentPrice: number,
-    priceHistory: any[],
-    marketData: any
-  ): Promise<TradingSignal> {
-    try {
-      // Get technical indicators
-      const technicalIndicators = this.technicalAnalysis.calculateTechnicalIndicators(priceHistory);
-      
-      // Get sentiment data
-      const sentimentData = await this.sentimentAnalyzer.analyzeSentiment(symbol);
-      
-      // Generate prediction
-      const prediction = await this.predictionEngine.generatePrediction(
-        symbol,
-        currentPrice,
-        technicalIndicators,
-        sentimentData,
-        priceHistory
-      );
-
-      // Determine trading action
-      const action = this.determineAction(technicalIndicators, sentimentData, prediction);
-      const confidence = this.calculateConfidence(technicalIndicators, sentimentData, prediction);
-      const reasoning = this.generateReasoning(technicalIndicators, sentimentData, prediction, action);
-
-      const signal: TradingSignal = {
-        id: uuidv4(),
-        symbol,
-        action,
-        confidence,
-        price: currentPrice,
-        targetPrice: prediction.predictions['24h'],
-        stopLoss: this.calculateStopLoss(currentPrice, action),
-        reasoning,
-        timestamp: new Date(),
-        technicalIndicators,
-        sentimentScore: sentimentData.overall,
-        riskLevel: this.assessRiskLevel(technicalIndicators, sentimentData)
-      };
-
-      this.signals.unshift(signal);
-      if (this.signals.length > 50) this.signals.pop();
-
-      return signal;
-    } catch (error) {
-      console.error('Error generating trading signal:', error);
-      throw error;
-    }
-  }
-
-  private determineAction(
-    technical: TechnicalIndicators,
-    sentiment: SentimentData,
-    prediction: any
-  ): 'BUY' | 'SELL' | 'HOLD' | 'SWAP' {
-    let score = 0;
-
-    // Technical analysis (50% weight)
-    if (technical.rsi < 30) score += 2;
-    else if (technical.rsi > 70) score -= 2;
-    
-    if (technical.macd > 0) score += 1;
-    else score -= 1;
-
-    if (technical.movingAverages.ema12 > technical.movingAverages.ema26) score += 1;
-    else score -= 1;
-
-    // Sentiment analysis (30% weight)
-    score += sentiment.overall * 2;
-
-    // Prediction confidence (20% weight)
-    const priceChange = (prediction.predictions['24h'] - prediction.predictions['1h']) / prediction.predictions['1h'];
-    score += priceChange * prediction.confidence * 2;
-
-    if (score > 2) return 'BUY';
-    if (score < -2) return 'SELL';
-    if (Math.abs(score) > 1) return 'SWAP';
-    return 'HOLD';
-  }
-
-  private calculateConfidence(
-    technical: TechnicalIndicators,
-    sentiment: SentimentData,
-    prediction: any
-  ): number {
-    let confidence = 0.5;
-
-    // Technical indicators alignment
-    const technicalSignals = [
-      technical.rsi < 30 || technical.rsi > 70,
-      Math.abs(technical.macd) > 0.1,
-      Math.abs(technical.movingAverages.ema12 - technical.movingAverages.ema26) > 0.05
-    ];
-    
-    const alignedSignals = technicalSignals.filter(Boolean).length;
-    confidence += (alignedSignals / technicalSignals.length) * 0.3;
-
-    // Sentiment strength
-    confidence += Math.abs(sentiment.overall) * 0.2;
-
-    // Prediction confidence
-    confidence += prediction.confidence * 0.3;
-
-    return Math.min(0.95, Math.max(0.1, confidence));
-  }
-
-  private generateReasoning(
-    technical: TechnicalIndicators,
-    sentiment: SentimentData,
-    prediction: any,
-    action: string
-  ): string[] {
-    const reasoning: string[] = [];
-
-    // Technical reasoning
-    if (technical.rsi < 30) reasoning.push('RSI indicates oversold conditions');
-    if (technical.rsi > 70) reasoning.push('RSI indicates overbought conditions');
-    if (technical.macd > 0) reasoning.push('MACD shows bullish momentum');
-    if (technical.macd < 0) reasoning.push('MACD shows bearish momentum');
-
-    // Sentiment reasoning
-    const sentimentLabel = this.sentimentAnalyzer.getSentimentLabel(sentiment.overall);
-    reasoning.push(`Social sentiment is ${sentimentLabel.toLowerCase()}`);
-
-    // Prediction reasoning
-    reasoning.push(...prediction.factors);
-
-    // Action-specific reasoning
-    switch (action) {
-      case 'BUY':
-        reasoning.push('Multiple indicators suggest upward price movement');
-        break;
-      case 'SELL':
-        reasoning.push('Multiple indicators suggest downward price movement');
-        break;
-      case 'SWAP':
-        reasoning.push('Mixed signals suggest considering alternative assets');
-        break;
-      case 'HOLD':
-        reasoning.push('Conflicting signals suggest maintaining current position');
-        break;
-    }
-
-    return reasoning;
-  }
-
-  private calculateStopLoss(currentPrice: number, action: string): number {
-    const stopLossPercentage = 0.05; // 5% stop loss
-    
-    if (action === 'BUY') {
-      return currentPrice * (1 - stopLossPercentage);
-    } else if (action === 'SELL') {
-      return currentPrice * (1 + stopLossPercentage);
-    }
-    
-    return currentPrice;
-  }
-
-  private assessRiskLevel(technical: TechnicalIndicators, sentiment: SentimentData): 'LOW' | 'MEDIUM' | 'HIGH' {
-    let riskScore = 0;
-
-    // Volatility risk
-    if (technical.volatility > 0.5) riskScore += 2;
-    else if (technical.volatility > 0.3) riskScore += 1;
-
-    // Sentiment uncertainty
-    if (Math.abs(sentiment.overall) < 0.2) riskScore += 1;
-
-    // Technical divergence
-    const rsiExtreme = technical.rsi < 20 || technical.rsi > 80;
-    if (rsiExtreme) riskScore += 1;
-
-    if (riskScore >= 3) return 'HIGH';
-    if (riskScore >= 2) return 'MEDIUM';
-    return 'LOW';
-  }
-
-  async executeTrade(signal: TradingSignal, amount: number): Promise<TradeExecution> {
-    // This is a simulation - in real implementation, this would connect to exchange APIs
-    const trade: TradeExecution = {
-      id: uuidv4(),
-      type: 'MARKET',
-      symbol: signal.symbol,
-      side: signal.action === 'BUY' ? 'BUY' : 'SELL',
-      amount,
-      price: signal.price,
-      status: 'FILLED',
-      timestamp: new Date(),
-      fees: amount * signal.price * 0.001 // 0.1% fee
+  private getDefaultConfig(): AutoTradingConfig {
+    return {
+      enabled: false,
+      strategy: {
+        name: 'Balanced Growth',
+        riskTolerance: 'MEDIUM',
+        maxPositionSize: 0.1, // 10% max per position
+        stopLossPercentage: 5,
+        takeProfitPercentage: 15,
+        minConfidence: 0.7
+      },
+      maxDailyTrades: 5,
+      maxPortfolioRisk: 0.3, // 30% max portfolio risk
+      symbols: ['BTC', 'ETH', 'ADA', 'DOT', 'LINK']
     };
-
-    this.portfolio.trades.unshift(trade);
-    this.updatePortfolio(trade);
-
-    return trade;
   }
 
-  private updatePortfolio(trade: TradeExecution): void {
-    const { symbol, side, amount, price } = trade;
-    
-    if (!this.portfolio.assets[symbol]) {
-      this.portfolio.assets[symbol] = {
-        amount: 0,
-        avgPrice: 0,
-        currentPrice: price || 0,
-        pnl: 0,
-        pnlPercentage: 0
-      };
-    }
-
-    const asset = this.portfolio.assets[symbol];
-    
-    if (side === 'BUY') {
-      const totalCost = (asset.amount * asset.avgPrice) + (amount * (price || 0));
-      const totalAmount = asset.amount + amount;
-      asset.avgPrice = totalAmount > 0 ? totalCost / totalAmount : 0;
-      asset.amount = totalAmount;
-    } else {
-      asset.amount = Math.max(0, asset.amount - amount);
-    }
-
-    this.calculatePortfolioValue();
-  }
-
-  private calculatePortfolioValue(): void {
-    let totalValue = 0;
-    
-    Object.entries(this.portfolio.assets).forEach(([symbol, asset]) => {
-      const value = asset.amount * asset.currentPrice;
-      totalValue += value;
-      
-      asset.pnl = (asset.currentPrice - asset.avgPrice) * asset.amount;
-      asset.pnlPercentage = asset.avgPrice > 0 ? (asset.pnl / (asset.avgPrice * asset.amount)) * 100 : 0;
-    });
-
-    this.portfolio.totalValue = totalValue;
-  }
-
+  // Public methods for UI interaction
   getPortfolio(): Portfolio {
     return { ...this.portfolio };
   }
 
-  getRecentSignals(limit: number = 10): TradingSignal[] {
-    return this.signals.slice(0, limit);
+  getActivePositions(): TradeExecution[] {
+    return Array.from(this.activePositions.values());
   }
 
-  setActive(active: boolean): void {
-    this.isActive = active;
+  getTradeHistory(): TradeExecution[] {
+    return [...this.tradeHistory];
   }
 
-  isActiveTrading(): boolean {
-    return this.isActive;
+  updateConfig(config: Partial<AutoTradingConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
+
+  getConfig(): AutoTradingConfig {
+    return { ...this.config };
   }
 }

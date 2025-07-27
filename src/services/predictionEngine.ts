@@ -1,8 +1,35 @@
-import { PredictionModel, TechnicalIndicators, SentimentData, PricePoint } from '../types/trading';
+import { TechnicalAnalysisService, TechnicalIndicators } from './technicalAnalysis';
+import { SentimentAnalyzer, SentimentData } from './sentimentAnalyzer';
+
+export interface PredictionResult {
+  symbol: string;
+  prediction: 'BUY' | 'SELL' | 'HOLD';
+  confidence: number;
+  targetPrice: number;
+  timeframe: string;
+  reasoning: string[];
+  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+  expectedReturn: number;
+  stopLoss: number;
+  takeProfit: number;
+}
+
+export interface MarketConditions {
+  trend: 'BULLISH' | 'BEARISH' | 'SIDEWAYS';
+  volatility: number;
+  volume: number;
+  marketCap: number;
+}
 
 export class PredictionEngine {
   private static instance: PredictionEngine;
-  private models = new Map<string, PredictionModel>();
+  private technicalAnalysis: TechnicalAnalysisService;
+  private sentimentAnalyzer: SentimentAnalyzer;
+
+  constructor() {
+    this.technicalAnalysis = TechnicalAnalysisService.getInstance();
+    this.sentimentAnalyzer = SentimentAnalyzer.getInstance();
+  }
 
   static getInstance(): PredictionEngine {
     if (!PredictionEngine.instance) {
@@ -14,179 +41,222 @@ export class PredictionEngine {
   async generatePrediction(
     symbol: string,
     currentPrice: number,
-    technicalIndicators: TechnicalIndicators,
-    sentimentData: SentimentData,
-    priceHistory: PricePoint[]
-  ): Promise<PredictionModel> {
-    const factors: string[] = [];
-    let confidence = 0.5;
-
-    // Technical analysis weight (40%)
-    const technicalScore = this.analyzeTechnicalFactors(technicalIndicators, factors);
-    
-    // Sentiment analysis weight (30%)
-    const sentimentScore = this.analyzeSentimentFactors(sentimentData, factors);
-    
-    // Price action weight (20%)
-    const priceActionScore = this.analyzePriceAction(priceHistory, factors);
-    
-    // Market structure weight (10%)
-    const marketStructureScore = this.analyzeMarketStructure(currentPrice, priceHistory, factors);
-
-    const overallScore = (technicalScore * 0.4) + (sentimentScore * 0.3) + 
-                        (priceActionScore * 0.2) + (marketStructureScore * 0.1);
-
-    confidence = Math.min(0.95, Math.max(0.1, Math.abs(overallScore)));
-
-    const predictions = this.calculatePricePredictions(currentPrice, overallScore, confidence);
-
-    const model: PredictionModel = {
-      symbol,
-      predictions,
-      confidence,
-      factors,
-      lastUpdated: new Date()
-    };
-
-    this.models.set(symbol, model);
-    return model;
-  }
-
-  private analyzeTechnicalFactors(indicators: TechnicalIndicators, factors: string[]): number {
-    let score = 0;
-    let count = 0;
-
-    // RSI analysis
-    if (indicators.rsi < 30) {
-      score += 0.7;
-      factors.push('RSI oversold - bullish signal');
-    } else if (indicators.rsi > 70) {
-      score -= 0.7;
-      factors.push('RSI overbought - bearish signal');
-    } else {
-      score += (50 - Math.abs(indicators.rsi - 50)) / 50 * 0.3;
-    }
-    count++;
-
-    // MACD analysis
-    if (indicators.macd > 0) {
-      score += 0.5;
-      factors.push('MACD positive - bullish momentum');
-    } else {
-      score -= 0.5;
-      factors.push('MACD negative - bearish momentum');
-    }
-    count++;
-
-    // Moving averages
-    if (indicators.movingAverages.ema12 > indicators.movingAverages.ema26) {
-      score += 0.4;
-      factors.push('EMA12 > EMA26 - short-term bullish');
-    } else {
-      score -= 0.4;
-      factors.push('EMA12 < EMA26 - short-term bearish');
-    }
-    count++;
-
-    // Volatility analysis
-    if (indicators.volatility > 0.5) {
-      factors.push('High volatility - increased risk');
-      score *= 0.8; // Reduce confidence in high volatility
-    } else if (indicators.volatility < 0.2) {
-      factors.push('Low volatility - stable conditions');
-      score *= 1.1; // Increase confidence in stable conditions
-    }
-
-    return count > 0 ? score / count : 0;
-  }
-
-  private analyzeSentimentFactors(sentimentData: SentimentData, factors: string[]): number {
-    const sentiment = sentimentData.overall;
-    
-    if (sentiment > 0.5) {
-      factors.push('Very positive social sentiment');
-      return 0.8;
-    } else if (sentiment > 0.2) {
-      factors.push('Positive social sentiment');
-      return 0.5;
-    } else if (sentiment < -0.5) {
-      factors.push('Very negative social sentiment');
-      return -0.8;
-    } else if (sentiment < -0.2) {
-      factors.push('Negative social sentiment');
-      return -0.5;
-    } else {
-      factors.push('Neutral social sentiment');
-      return 0;
+    priceHistory: number[],
+    marketConditions: MarketConditions
+  ): Promise<PredictionResult> {
+    try {
+      // Get technical indicators
+      const indicators = this.calculateTechnicalIndicators(priceHistory);
+      
+      // Get sentiment data
+      const sentimentData = await this.sentimentAnalyzer.analyzeSentiment(symbol);
+      
+      // Analyze technical signals
+      const technicalSignals = this.technicalAnalysis.analyzeIndicators(indicators);
+      const technicalOverall = this.technicalAnalysis.getOverallSignal(technicalSignals);
+      
+      // Calculate prediction scores
+      const technicalScore = this.getTechnicalScore(technicalOverall);
+      const sentimentScore = this.getSentimentScore(sentimentData);
+      const marketScore = this.getMarketScore(marketConditions);
+      
+      // Weighted prediction
+      const weights = { technical: 0.5, sentiment: 0.3, market: 0.2 };
+      const overallScore = (
+        technicalScore * weights.technical +
+        sentimentScore * weights.sentiment +
+        marketScore * weights.market
+      );
+      
+      // Generate prediction
+      const prediction = this.determinePrediction(overallScore);
+      const confidence = this.calculateConfidence(technicalOverall.confidence, sentimentData, marketConditions);
+      
+      // Calculate price targets
+      const { targetPrice, stopLoss, takeProfit } = this.calculatePriceTargets(
+        currentPrice,
+        prediction,
+        indicators,
+        marketConditions.volatility
+      );
+      
+      // Generate reasoning
+      const reasoning = this.generateReasoning(
+        technicalSignals,
+        sentimentData,
+        marketConditions,
+        prediction
+      );
+      
+      return {
+        symbol,
+        prediction,
+        confidence,
+        targetPrice,
+        timeframe: this.determineTimeframe(marketConditions.volatility),
+        reasoning,
+        riskLevel: this.assessRiskLevel(confidence, marketConditions.volatility),
+        expectedReturn: this.calculateExpectedReturn(currentPrice, targetPrice),
+        stopLoss,
+        takeProfit
+      };
+    } catch (error) {
+      console.error('Error generating prediction:', error);
+      return this.getDefaultPrediction(symbol, currentPrice);
     }
   }
 
-  private analyzePriceAction(priceHistory: PricePoint[], factors: string[]): number {
-    if (priceHistory.length < 7) return 0;
-
-    const recent = priceHistory.slice(-7);
-    const older = priceHistory.slice(-14, -7);
-    
-    const recentAvg = recent.reduce((sum, p) => sum + p.price, 0) / recent.length;
-    const olderAvg = older.reduce((sum, p) => sum + p.price, 0) / older.length;
-    
-    const trend = (recentAvg - olderAvg) / olderAvg;
-    
-    if (trend > 0.05) {
-      factors.push('Strong upward price trend');
-      return 0.6;
-    } else if (trend > 0.02) {
-      factors.push('Moderate upward price trend');
-      return 0.3;
-    } else if (trend < -0.05) {
-      factors.push('Strong downward price trend');
-      return -0.6;
-    } else if (trend < -0.02) {
-      factors.push('Moderate downward price trend');
-      return -0.3;
-    } else {
-      factors.push('Sideways price action');
-      return 0;
-    }
-  }
-
-  private analyzeMarketStructure(currentPrice: number, priceHistory: PricePoint[], factors: string[]): number {
-    if (priceHistory.length < 20) return 0;
-
-    const prices = priceHistory.map(p => p.price);
-    const high20 = Math.max(...prices.slice(-20));
-    const low20 = Math.min(...prices.slice(-20));
-    
-    const position = (currentPrice - low20) / (high20 - low20);
-    
-    if (position > 0.8) {
-      factors.push('Price near 20-day high - resistance level');
-      return -0.2;
-    } else if (position < 0.2) {
-      factors.push('Price near 20-day low - support level');
-      return 0.2;
-    } else {
-      factors.push('Price in middle range');
-      return 0;
-    }
-  }
-
-  private calculatePricePredictions(currentPrice: number, score: number, confidence: number) {
-    const baseMultiplier = score * confidence;
+  private calculateTechnicalIndicators(priceHistory: number[]): TechnicalIndicators {
+    const rsi = this.technicalAnalysis.calculateRSI(priceHistory);
+    const macd = this.technicalAnalysis.calculateMACD(priceHistory);
+    const bollingerBands = this.technicalAnalysis.calculateBollingerBands(priceHistory);
     
     return {
-      '1h': currentPrice * (1 + baseMultiplier * 0.01),
-      '4h': currentPrice * (1 + baseMultiplier * 0.03),
-      '24h': currentPrice * (1 + baseMultiplier * 0.08),
-      '7d': currentPrice * (1 + baseMultiplier * 0.15)
+      rsi,
+      macd,
+      bollingerBands,
+      movingAverages: {
+        sma20: this.technicalAnalysis.calculateSMA(priceHistory, 20),
+        sma50: this.technicalAnalysis.calculateSMA(priceHistory, 50),
+        sma200: this.technicalAnalysis.calculateSMA(priceHistory, 200),
+        ema12: this.technicalAnalysis.calculateEMA(priceHistory, 12),
+        ema26: this.technicalAnalysis.calculateEMA(priceHistory, 26)
+      },
+      stochastic: this.technicalAnalysis.calculateStochastic(priceHistory, priceHistory, priceHistory),
+      volume: {
+        current: 1000000,
+        average: 800000,
+        ratio: 1.25
+      }
     };
   }
 
-  getPrediction(symbol: string): PredictionModel | null {
-    return this.models.get(symbol) || null;
+  private getTechnicalScore(technicalOverall: { signal: string; confidence: number }): number {
+    const baseScore = technicalOverall.signal === 'BUY' ? 1 : 
+                     technicalOverall.signal === 'SELL' ? -1 : 0;
+    return baseScore * technicalOverall.confidence;
   }
 
-  getAllPredictions(): PredictionModel[] {
-    return Array.from(this.models.values());
+  private getSentimentScore(sentimentData: SentimentData): number {
+    return sentimentData.overall;
+  }
+
+  private getMarketScore(marketConditions: MarketConditions): number {
+    let score = 0;
+    
+    if (marketConditions.trend === 'BULLISH') score += 0.5;
+    else if (marketConditions.trend === 'BEARISH') score -= 0.5;
+    
+    // Lower volatility is generally better for predictions
+    score += (1 - marketConditions.volatility) * 0.3;
+    
+    // Higher volume indicates stronger moves
+    score += Math.min(marketConditions.volume / 1000000, 1) * 0.2;
+    
+    return Math.max(-1, Math.min(1, score));
+  }
+
+  private determinePrediction(score: number): 'BUY' | 'SELL' | 'HOLD' {
+    if (score > 0.3) return 'BUY';
+    if (score < -0.3) return 'SELL';
+    return 'HOLD';
+  }
+
+  private calculateConfidence(
+    technicalConfidence: number,
+    sentimentData: SentimentData,
+    marketConditions: MarketConditions
+  ): number {
+    const sentimentConfidence = Math.abs(sentimentData.overall);
+    const marketConfidence = 1 - marketConditions.volatility;
+    
+    return (technicalConfidence + sentimentConfidence + marketConfidence) / 3;
+  }
+
+  private calculatePriceTargets(
+    currentPrice: number,
+    prediction: string,
+    indicators: TechnicalIndicators,
+    volatility: number
+  ): { targetPrice: number; stopLoss: number; takeProfit: number } {
+    const volatilityMultiplier = 1 + volatility;
+    
+    let targetPrice = currentPrice;
+    let stopLoss = currentPrice;
+    let takeProfit = currentPrice;
+    
+    if (prediction === 'BUY') {
+      targetPrice = indicators.bollingerBands.upper * volatilityMultiplier;
+      stopLoss = currentPrice * 0.95; // 5% stop loss
+      takeProfit = currentPrice * 1.15; // 15% take profit
+    } else if (prediction === 'SELL') {
+      targetPrice = indicators.bollingerBands.lower / volatilityMultiplier;
+      stopLoss = currentPrice * 1.05; // 5% stop loss for short
+      takeProfit = currentPrice * 0.85; // 15% take profit for short
+    }
+    
+    return { targetPrice, stopLoss, takeProfit };
+  }
+
+  private generateReasoning(
+    technicalSignals: any[],
+    sentimentData: SentimentData,
+    marketConditions: MarketConditions,
+    prediction: string
+  ): string[] {
+    const reasoning: string[] = [];
+    
+    // Technical reasoning
+    technicalSignals.forEach(signal => {
+      reasoning.push(`${signal.indicator}: ${signal.description}`);
+    });
+    
+    // Sentiment reasoning
+    const sentimentLabel = this.sentimentAnalyzer.getSentimentLabel(sentimentData.overall);
+    reasoning.push(`Market sentiment is ${sentimentLabel.toLowerCase()} (${(sentimentData.overall * 100).toFixed(1)}%)`);
+    
+    // Market conditions reasoning
+    reasoning.push(`Market trend is ${marketConditions.trend.toLowerCase()}`);
+    reasoning.push(`Volatility is ${marketConditions.volatility > 0.5 ? 'high' : 'moderate'}`);
+    
+    // Volume reasoning
+    if (marketConditions.volume > 1000000) {
+      reasoning.push('High trading volume supports the move');
+    }
+    
+    return reasoning;
+  }
+
+  private determineTimeframe(volatility: number): string {
+    if (volatility > 0.7) return '1-3 days';
+    if (volatility > 0.4) return '3-7 days';
+    return '1-2 weeks';
+  }
+
+  private assessRiskLevel(confidence: number, volatility: number): 'LOW' | 'MEDIUM' | 'HIGH' {
+    const riskScore = (1 - confidence) + volatility;
+    
+    if (riskScore < 0.4) return 'LOW';
+    if (riskScore < 0.7) return 'MEDIUM';
+    return 'HIGH';
+  }
+
+  private calculateExpectedReturn(currentPrice: number, targetPrice: number): number {
+    return ((targetPrice - currentPrice) / currentPrice) * 100;
+  }
+
+  private getDefaultPrediction(symbol: string, currentPrice: number): PredictionResult {
+    return {
+      symbol,
+      prediction: 'HOLD',
+      confidence: 0.5,
+      targetPrice: currentPrice,
+      timeframe: '1 week',
+      reasoning: ['Insufficient data for accurate prediction'],
+      riskLevel: 'MEDIUM',
+      expectedReturn: 0,
+      stopLoss: currentPrice * 0.95,
+      takeProfit: currentPrice * 1.05
+    };
   }
 }

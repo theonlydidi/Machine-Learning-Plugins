@@ -1,5 +1,22 @@
-import { SentimentData } from '../types/trading';
 import { WebScraperService } from './webScraper';
+
+export interface SentimentData {
+  symbol: string;
+  overall: number;
+  sources: {
+    news: number;
+    twitter: number;
+    reddit: number;
+    telegram: number;
+  };
+  volume: {
+    news: number;
+    social: number;
+  };
+  trending: boolean;
+  keywords: string[];
+  timestamp: Date;
+}
 
 export class SentimentAnalyzer {
   private static instance: SentimentAnalyzer;
@@ -18,89 +35,114 @@ export class SentimentAnalyzer {
 
   async analyzeSentiment(symbol: string): Promise<SentimentData> {
     try {
-      const [twitter, reddit, telegram, news] = await Promise.all([
-        this.webScraper.scrapeTwitterSentiment(symbol),
-        this.webScraper.scrapeRedditSentiment(symbol),
-        this.webScraper.scrapeTelegramChannels(symbol),
-        this.webScraper.scrapeCoinMarketCapNews(symbol)
+      const [newsData, socialData] = await Promise.all([
+        this.webScraper.scrapeNewsData(symbol),
+        this.webScraper.scrapeSocialMedia(symbol)
       ]);
 
-      const twitterSentiment = twitter?.sentiment || 0;
-      const redditSentiment = reddit?.sentiment || 0;
-      const telegramSentiment = telegram?.overallSentiment || 0;
-      const newsSentiment = this.calculateNewsSentiment(news);
+      const newsSentiment = this.calculateNewsSentiment(newsData);
+      const socialSentiment = socialData ? {
+        twitter: socialData.twitter.sentiment,
+        reddit: socialData.reddit.sentiment,
+        telegram: socialData.telegram.sentiment
+      } : { twitter: 0, reddit: 0, telegram: 0 };
 
-      const overall = (twitterSentiment * 0.3 + redditSentiment * 0.25 + 
-                      telegramSentiment * 0.2 + newsSentiment * 0.25);
-
-      const keywords = this.extractKeywords([
-        ...(twitter?.topTweets?.map((t: any) => t.text) || []),
-        ...(reddit?.posts?.map((p: any) => p.title) || []),
-        ...(news?.map((n: any) => n.title) || [])
-      ]);
-
-      const mentions = (twitter?.volume || 0) + (reddit?.mentions || 0);
+      const overall = this.calculateOverallSentiment(newsSentiment, socialSentiment);
+      const keywords = this.extractKeywords(newsData);
 
       return {
-        overall: Math.max(-1, Math.min(1, overall)),
+        symbol,
+        overall,
         sources: {
-          twitter: twitterSentiment,
-          reddit: redditSentiment,
           news: newsSentiment,
-          telegram: telegramSentiment
+          twitter: socialSentiment.twitter,
+          reddit: socialSentiment.reddit,
+          telegram: socialSentiment.telegram
         },
+        volume: {
+          news: newsData.length,
+          social: socialData ? 
+            socialData.twitter.mentions + socialData.reddit.posts + socialData.telegram.messages : 0
+        },
+        trending: socialData ? socialData.twitter.trending : false,
         keywords,
-        mentions,
         timestamp: new Date()
       };
     } catch (error) {
       console.error('Error analyzing sentiment:', error);
-      return {
-        overall: 0,
-        sources: { twitter: 0, reddit: 0, news: 0, telegram: 0 },
-        keywords: [],
-        mentions: 0,
-        timestamp: new Date()
-      };
+      return this.getDefaultSentiment(symbol);
     }
   }
 
-  private calculateNewsSentiment(news: any[]): number {
-    if (!news || news.length === 0) return 0;
+  private calculateNewsSentiment(newsData: any[]): number {
+    if (!newsData.length) return 0;
     
-    const totalScore = news.reduce((sum, article) => sum + (article.score || 0), 0);
-    return totalScore / news.length;
+    const totalSentiment = newsData.reduce((sum, article) => sum + article.sentiment, 0);
+    return totalSentiment / newsData.length;
   }
 
-  private extractKeywords(texts: string[]): string[] {
-    const keywords = new Set<string>();
-    const commonWords = ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'];
-    
-    texts.forEach(text => {
-      const words = text.toLowerCase()
-        .replace(/[^\w\s]/g, '')
-        .split(/\s+/)
-        .filter(word => word.length > 3 && !commonWords.includes(word));
-      
-      words.forEach(word => keywords.add(word));
-    });
+  private calculateOverallSentiment(newsSentiment: number, socialSentiment: any): number {
+    const weights = {
+      news: 0.4,
+      twitter: 0.3,
+      reddit: 0.2,
+      telegram: 0.1
+    };
 
-    return Array.from(keywords).slice(0, 10);
+    return (
+      newsSentiment * weights.news +
+      socialSentiment.twitter * weights.twitter +
+      socialSentiment.reddit * weights.reddit +
+      socialSentiment.telegram * weights.telegram
+    );
+  }
+
+  private extractKeywords(newsData: any[]): string[] {
+    const allText = newsData.map(article => 
+      `${article.title} ${article.description}`
+    ).join(' ').toLowerCase();
+
+    const commonWords = ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'];
+    const words = allText.split(/\s+/).filter(word => 
+      word.length > 3 && !commonWords.includes(word)
+    );
+
+    const wordCount = words.reduce((acc, word) => {
+      acc[word] = (acc[word] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+
+    return Object.entries(wordCount)
+      .sort(([,a], [,b]) => b - a)
+      .slice(0, 10)
+      .map(([word]) => word);
+  }
+
+  private getDefaultSentiment(symbol: string): SentimentData {
+    return {
+      symbol,
+      overall: 0,
+      sources: { news: 0, twitter: 0, reddit: 0, telegram: 0 },
+      volume: { news: 0, social: 0 },
+      trending: false,
+      keywords: [],
+      timestamp: new Date()
+    };
   }
 
   getSentimentLabel(score: number): string {
-    if (score > 0.5) return 'Very Bullish';
+    if (score > 0.6) return 'Very Bullish';
     if (score > 0.2) return 'Bullish';
     if (score > -0.2) return 'Neutral';
-    if (score > -0.5) return 'Bearish';
+    if (score > -0.6) return 'Bearish';
     return 'Very Bearish';
   }
 
   getSentimentColor(score: number): string {
-    if (score > 0.5) return '#10B981';
-    if (score > 0.2) return '#34D399';
-    if (score > -0.2) return '#6B7280';
-    if (score > -0.5) return '#F87171';
-    return '#EF4444';
+    if (score > 0.6) return '#10b981';
+    if (score > 0.2) return '#84cc16';
+    if (score > -0.2) return '#6b7280';
+    if (score > -0.6) return '#f59e0b';
+    return '#ef4444';
   }
 }
